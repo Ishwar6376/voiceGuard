@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VoiceGuard v2 — Deep Learning Voice Alarm</title>
+  <meta name="description" content="Enroll your voice, add voice notes to improve accuracy, fine-tune your personal model, and trigger alarms with keyword detection. Powered by ECAPA-TDNN deep learning." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- Background -->
+  <div class="bg-mesh"></div>
+  <div class="bg-orb orb-1"></div>
+  <div class="bg-orb orb-2"></div>
+  <div class="bg-orb orb-3"></div>
+
+  <!-- Alarm Overlay -->
+  <div id="alarm-overlay" class="alarm-overlay hidden">
+    <div class="alarm-content">
+      <div class="alarm-pulse-ring"></div>
+      <div class="alarm-icon">🚨</div>
+      <h2 class="alarm-title">ALARM TRIGGERED</h2>
+      <p class="alarm-speaker" id="alarm-speaker-name">Keyword detected!</p>
+      <div class="alarm-scores" id="alarm-scores"></div>
+      <button id="alarm-stop-btn" class="btn-alarm-stop">Stop Alarm</button>
+    </div>
+  </div>
+
+  <!-- App Shell -->
+  <div class="app">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="logo">
+        <span class="logo-icon">🎙️</span>
+        <span class="logo-text">VoiceGuard</span>
+        <span class="logo-version">v2</span>
+      </div>
+      <nav class="nav">
+        <button id="nav-enroll"  class="nav-item active" data-page="enroll">
+          <span class="nav-icon">👤</span>
+          <span class="nav-label">Enroll</span>
+        </button>
+        <button id="nav-voice-notes" class="nav-item" data-page="voice-notes">
+          <span class="nav-icon">🎵</span>
+          <span class="nav-label">Voice Notes</span>
+        </button>
+        <button id="nav-monitor" class="nav-item" data-page="monitor">
+          <span class="nav-icon">📡</span>
+          <span class="nav-label">Monitor</span>
+        </button>
+        <button id="nav-settings" class="nav-item" data-page="settings">
+          <span class="nav-icon">⚙️</span>
+          <span class="nav-label">Settings</span>
+        </button>
+      </nav>
+      <div class="sidebar-status">
+        <div class="status-dot" id="backend-status-dot"></div>
+        <span id="backend-status-text">Connecting…</span>
+      </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="main">
+      <!-- ═══ PAGE: ENROLL ═══════════════════════════════════════════════ -->
+      <section id="page-enroll" class="page active">
+        <div class="page-header">
+          <h1>Enroll Speaker</h1>
+          <p class="page-subtitle">Record your voice — this becomes your first voice note. Add more notes later to improve accuracy.</p>
+        </div>
+
+        <div class="enroll-grid">
+          <!-- Record Card -->
+          <div class="card glass record-card">
+            <h2 class="card-title">Record Keyword</h2>
+
+            <div class="form-group">
+              <label for="speaker-name" class="form-label">Speaker Name</label>
+              <input type="text" id="speaker-name" class="form-input" placeholder='e.g. Ishwar' maxlength="32" />
+            </div>
+
+            <div class="form-group">
+              <label for="speaker-keyword" class="form-label">Keyword / Trigger Phrase
+                <span class="form-label-hint">— exact phrase to detect (e.g. &ldquo;open sesame&rdquo;)</span>
+              </label>
+              <input type="text" id="speaker-keyword" class="form-input" placeholder='e.g. open sesame' maxlength="64" />
+            </div>
+
+            <div class="form-group">
+              <label class="form-label">Duration</label>
+              <div class="duration-chips">
+                <button class="chip" data-duration="2">2s</button>
+                <button class="chip active" data-duration="3">3s</button>
+                <button class="chip" data-duration="5">5s</button>
+              </div>
+            </div>
+
+            <div class="waveform-container" id="enroll-waveform-container">
+              <canvas id="enroll-waveform" class="waveform-canvas"></canvas>
+              <div class="waveform-placeholder" id="waveform-placeholder">
+                <span>Press Record to start</span>
+              </div>
+            </div>
+
+            <div class="record-controls">
+              <button id="record-btn" class="btn-record">
+                <span class="record-icon">⏺</span>
+                <span id="record-btn-text">Record</span>
+              </button>
+              <div class="record-timer hidden" id="record-timer">
+                <span class="timer-dot"></span>
+                <span id="timer-value">0.0s</span>
+              </div>
+            </div>
+
+            <div id="enroll-status" class="enroll-status hidden"></div>
+
+            <!-- Enroll Transcript Box -->
+            <div id="enroll-transcript-wrap" class="transcript-wrap hidden">
+              <div class="transcript-label">🗣 What we heard during recording</div>
+              <div id="enroll-transcript" class="transcript-text">…</div>
+            </div>
+
+            <button id="save-btn" class="btn-primary w-full hidden">
+              Save Voiceprint
+            </button>
+          </div>
+
+          <!-- Enrolled Speakers Card -->
+          <div class="card glass speakers-card">
+            <div class="card-header-row">
+              <h2 class="card-title">Enrolled Speakers</h2>
+              <button id="refresh-speakers-btn" class="btn-icon" title="Refresh">↻</button>
+            </div>
+            <div id="speakers-list" class="speakers-list">
+              <div class="empty-state">No speakers enrolled yet.</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══ PAGE: VOICE NOTES ════════════════════════════════════════════ -->
+      <section id="page-voice-notes" class="page">
+        <div class="page-header">
+          <h1>Voice Notes</h1>
+          <p class="page-subtitle">Add voice recordings to improve identification accuracy. Fine-tune your model after adding 5+ notes.</p>
+        </div>
+
+        <div class="voice-notes-layout">
+          <!-- Speaker selector + recorder -->
+          <div class="card glass vn-recorder-card">
+            <h2 class="card-title">Add Voice Note</h2>
+
+            <div class="form-group">
+              <label for="vn-speaker-select" class="form-label">Speaker</label>
+              <select id="vn-speaker-select" class="form-select">
+                <option value="">— Select Speaker —</option>
+              </select>
+            </div>
+
+            <div id="vn-record-section" class="vn-record-section hidden">
+              <div class="form-group">
+                <label class="form-label">Duration</label>
+                <div class="duration-chips">
+                  <button class="chip vn-dur-chip active" data-duration="3">3s</button>
+                  <button class="chip vn-dur-chip" data-duration="5">5s</button>
+                  <button class="chip vn-dur-chip" data-duration="8">8s</button>
+                  <button class="chip vn-dur-chip" data-duration="10">10s</button>
+                </div>
+              </div>
+
+              <div class="waveform-container" id="vn-waveform-container">
+                <canvas id="vn-waveform" class="waveform-canvas"></canvas>
+                <div class="waveform-placeholder" id="vn-waveform-placeholder">
+                  <span>Press Record to add a voice note</span>
+                </div>
+              </div>
+
+              <div class="record-controls">
+                <button id="vn-record-btn" class="btn-record">
+                  <span class="record-icon">⏺</span>
+                  <span id="vn-record-btn-text">Record</span>
+                </button>
+                <div class="record-timer hidden" id="vn-record-timer">
+                  <span class="timer-dot"></span>
+                  <span id="vn-timer-value">0.0s</span>
+                </div>
+              </div>
+
+              <div id="vn-status" class="enroll-status hidden"></div>
+
+              <button id="vn-save-btn" class="btn-primary w-full hidden">
+                Save Voice Note
+              </button>
+            </div>
+          </div>
+
+          <!-- Voice notes list + model status -->
+          <div class="vn-right-col">
+            <!-- Model Status Card -->
+            <div class="card glass vn-model-card">
+              <h2 class="card-title">Model Status</h2>
+              <div id="vn-model-status" class="vn-model-status">
+                <div class="empty-state-sm">Select a speaker to view model status.</div>
+              </div>
+            </div>
+
+            <!-- Voice Notes List -->
+            <div class="card glass vn-list-card">
+              <div class="card-header-row">
+                <h2 class="card-title">Voice Notes</h2>
+                <span id="vn-count-badge" class="vn-count-badge">0</span>
+              </div>
+              <div id="vn-notes-list" class="vn-notes-list">
+                <div class="empty-state-sm">Select a speaker to view voice notes.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══ PAGE: MONITOR ══════════════════════════════════════════════ -->
+      <section id="page-monitor" class="page">
+        <div class="page-header">
+          <h1>Live Monitor</h1>
+          <p class="page-subtitle">Real-time keyword detection with deep learning speaker verification.</p>
+        </div>
+
+        <div class="monitor-controls-bar">
+          <div class="form-group inline">
+            <label for="monitor-speaker-select" class="form-label">Listening for</label>
+            <select id="monitor-speaker-select" class="form-select">
+              <option value="">— Select Speaker —</option>
+            </select>
+          </div>
+          <!-- Keyword badge shown when a keyword is configured -->
+          <div id="keyword-badge-wrap" class="keyword-badge-wrap hidden">
+            <span class="keyword-badge">🔑 <span id="active-keyword-text"></span></span>
+          </div>
+          <!-- Matching mode badge -->
+          <div id="matching-mode-wrap" class="matching-mode-wrap hidden">
+            <span id="matching-mode-badge" class="matching-mode-badge">similarity</span>
+          </div>
+          <button id="listen-btn" class="btn-listen" disabled>
+            <span id="listen-btn-icon">▶</span>
+            <span id="listen-btn-text">Start Listening</span>
+          </button>
+        </div>
+
+        <!-- Live Transcript Bar -->
+        <div id="live-transcript-bar" class="live-transcript-bar hidden">
+          <span class="transcript-icon">🎤</span>
+          <span id="live-transcript-text" class="live-transcript-text">Listening for speech…</span>
+          <span id="keyword-match-badge" class="keyword-match-badge hidden">✅ Keyword detected</span>
+        </div>
+
+        <div class="monitor-grid">
+          <!-- Level Meter -->
+          <div class="card glass meter-card">
+            <h3 class="card-title-sm">Audio Level</h3>
+            <div class="level-meter-wrap">
+              <canvas id="level-meter" class="level-meter-canvas"></canvas>
+            </div>
+            <div class="vad-indicator" id="vad-indicator">
+              <span class="vad-dot"></span>
+              <span id="vad-label">Silence</span>
+            </div>
+          </div>
+
+          <!-- FFT Spectrum -->
+          <div class="card glass spectrum-card">
+            <h3 class="card-title-sm">FFT Spectrum</h3>
+            <canvas id="fft-canvas" class="spectrum-canvas"></canvas>
+          </div>
+
+          <!-- Score Gauges — updated for v2 -->
+          <div class="card glass score-card">
+            <h3 class="card-title-sm">Match Scores</h3>
+            <div class="score-gauges">
+              <div class="gauge-wrap">
+                <label class="gauge-label">Similarity <span class="badge badge-dl">Embedding</span></label>
+                <div class="gauge-bar-bg">
+                  <div class="gauge-bar gauge-bar-dl" id="dl-score-bar" style="width:0%"></div>
+                </div>
+                <span class="gauge-value" id="dl-score-val">—</span>
+              </div>
+              <div class="gauge-wrap" id="classifier-gauge-wrap" style="display:none">
+                <label class="gauge-label">Classifier <span class="badge badge-classifier">Fine-tuned</span></label>
+                <div class="gauge-bar-bg">
+                  <div class="gauge-bar gauge-bar-classifier" id="classifier-score-bar" style="width:0%"></div>
+                </div>
+                <span class="gauge-value" id="classifier-score-val">—</span>
+              </div>
+              <div class="gauge-wrap fusion-wrap">
+                <label class="gauge-label">Match Score <span class="badge badge-fusion" id="match-mode-label">Final</span></label>
+                <div class="gauge-bar-bg">
+                  <div class="gauge-bar gauge-bar-fusion" id="fusion-score-bar" style="width:0%"></div>
+                </div>
+                <span class="gauge-value" id="fusion-score-val">—</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Match Log -->
+          <div class="card glass log-card">
+            <div class="card-header-row">
+              <h3 class="card-title-sm">Match Log</h3>
+              <button id="clear-log-btn" class="btn-icon-sm">Clear</button>
+            </div>
+            <div id="match-log" class="match-log">
+              <div class="empty-state-sm">Start listening to see events…</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══ PAGE: SETTINGS ════════════════════════════════════════════ -->
+      <section id="page-settings" class="page">
+        <div class="page-header">
+          <h1>Settings</h1>
+          <p class="page-subtitle">Configure thresholds for speaker verification.</p>
+        </div>
+
+        <div class="settings-grid">
+          <div class="card glass">
+            <h2 class="card-title">Speaker Thresholds</h2>
+            <div class="form-group">
+              <label for="settings-speaker-select" class="form-label">Speaker</label>
+              <select id="settings-speaker-select" class="form-select">
+                <option value="">— Select Speaker —</option>
+              </select>
+            </div>
+
+            <div id="threshold-controls" class="threshold-section hidden">
+              <div class="slider-group">
+                <div class="slider-row">
+                  <label class="slider-label">Similarity Threshold <span class="badge badge-dl">Embedding</span></label>
+                  <span id="similarity-threshold-val" class="slider-value">0.65</span>
+                </div>
+                <input type="range" id="similarity-threshold" class="slider" min="0.3" max="0.95" step="0.01" value="0.65" />
+                <p class="slider-hint">Cosine similarity threshold for centroid matching. Higher = stricter.</p>
+              </div>
+
+              <div class="slider-group">
+                <div class="slider-row">
+                  <label class="slider-label">Classifier Threshold <span class="badge badge-classifier">Fine-tuned</span></label>
+                  <span id="classifier-threshold-val" class="slider-value">0.70</span>
+                </div>
+                <input type="range" id="classifier-threshold" class="slider" min="0.3" max="0.95" step="0.01" value="0.70" />
+                <p class="slider-hint">Confidence threshold for the fine-tuned classifier. Only used when model is trained.</p>
+              </div>
+
+              <button id="save-settings-btn" class="btn-primary">Save Settings</button>
+              <div id="settings-saved-msg" class="settings-saved-msg hidden">✅ Settings saved!</div>
+            </div>
+          </div>
+
+          <div class="card glass">
+            <h2 class="card-title">System Info</h2>
+            <div id="system-info" class="system-info">Loading…</div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js" type="module"></script>
+</body>
+</html>
