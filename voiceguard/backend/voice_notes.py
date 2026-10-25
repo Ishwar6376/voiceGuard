@@ -1,10 +1,13 @@
 """
 voice_notes.py — Incremental voice note management for speaker learning
 
-Voice notes are short audio recordings that users add over time.
-Each note is stored as a WAV file alongside its pre-computed speaker embedding.
-The embeddings are averaged into a "centroid" for similarity-based matching,
-and used as training data for fine-tuning the classifier head.
+Voice notes are short recordings the user adds over time. For each note we
+store the WAV plus the speaker embeddings of every 1.5 s window in it
+(the same window size used when listening live).
+
+  - The average of all window embeddings is the speaker's "centroid"
+    voiceprint used for live matching.
+  - With several notes, calibrator.py uses them to learn a personal threshold.
 """
 import uuid
 import logging
@@ -20,14 +23,13 @@ logger = logging.getLogger("voice_notes")
 # ─── Configuration ───────────────────────────────────────────────────────────
 VOICE_NOTES_DIR = Path(__file__).parent / "storage" / "voice_notes"
 
-MIN_DURATION_S = 1.0    # minimum voice note duration in seconds
-MAX_DURATION_S = 30.0   # maximum voice note duration in seconds
-MIN_RMS        = 0.001  # minimum RMS to consider audio non-silent
-MIN_NOTES_FOR_FINETUNE = 5
+MIN_DURATION_S = 1.5    # at least one full analysis window
+MAX_DURATION_S = 30.0
+MIN_RMS        = 0.001
+EMBED_VERSION  = 2      # 2 = per-window, unit-normalised embeddings
 
 
 def _ensure_dir(speaker_id: str) -> Path:
-    """Ensure the voice notes directory exists for a speaker."""
     d = VOICE_NOTES_DIR / speaker_id
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -37,28 +39,12 @@ def _ensure_dir(speaker_id: str) -> Path:
 
 def add_voice_note(speaker_id: str, audio_bytes: bytes, metadata: dict = None) -> dict:
     """
-    Add a voice note for a speaker.
-
-    Steps:
-      1. Decode and validate the audio
-      2. Compute the ECAPA-TDNN embedding
-      3. Store WAV + embedding + metadata
-
-    Args:
-        speaker_id:  Enrolled speaker identifier.
-        audio_bytes: Raw audio file bytes (WAV, FLAC, etc.).
-        metadata:    Optional extra metadata to store with the note.
-
-    Returns:
-        Note metadata dict: {note_id, speaker_id, duration_s, rms, embedding_norm, ...}
+    Decode + validate audio, compute window embeddings, and store the note.
 
     Raises:
-        ValueError: If audio is too short, too long, too quiet, or embedding fails.
+        ValueError: If audio is too short, too long, too quiet, or has no speech.
     """
-    # Lazy import to avoid circular dependency at module load time
-    from model_manager import get_embedding
-
-    note_dir = _ensure_dir(speaker_id)
+    from model_manager import get_window_embeddings
 
     # ── 1. Load and validate audio ────────────────────────────────────────
     audio = load_audio(audio_bytes, target_sr=SR)
@@ -66,68 +52,54 @@ def add_voice_note(speaker_id: str, audio_bytes: bytes, metadata: dict = None) -
 
     if duration < MIN_DURATION_S:
         raise ValueError(
-            f"Voice note too short ({duration:.1f}s). "
-            f"Minimum is {MIN_DURATION_S}s."
+            f"Voice note too short ({duration:.1f}s). Minimum is {MIN_DURATION_S}s."
         )
     if duration > MAX_DURATION_S:
         raise ValueError(
-            f"Voice note too long ({duration:.1f}s). "
-            f"Maximum is {MAX_DURATION_S}s."
+            f"Voice note too long ({duration:.1f}s). Maximum is {MAX_DURATION_S}s."
         )
 
     rms = float(np.sqrt(np.mean(audio ** 2)))
     if rms < MIN_RMS:
         raise ValueError("Voice note is too quiet. Please speak louder.")
 
-    # ── 2. Compute embedding ──────────────────────────────────────────────
-    embedding = get_embedding(audio, SR)
-    if embedding is None:
+    # ── 2. Compute embeddings ─────────────────────────────────────────────
+    embeddings = get_window_embeddings(audio, SR)
+    if len(embeddings) == 0:
         raise ValueError(
-            "Could not extract a speaker embedding from this recording. "
-            "Please try recording again with clearer speech."
+            "Not enough clear speech in this recording. Please talk continuously "
+            "for the whole recording (e.g. read a sentence aloud), a little louder."
         )
 
-    # ── 3. Generate unique note ID ────────────────────────────────────────
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    short_uuid = uuid.uuid4().hex[:6]
-    note_id = f"note_{timestamp}_{short_uuid}"
+    # ── 3. Save files ─────────────────────────────────────────────────────
+    note_dir = _ensure_dir(speaker_id)
+    note_id = f"note_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
 
-    # ── 4. Save files ─────────────────────────────────────────────────────
-    # WAV audio
-    wav_path = note_dir / f"{note_id}.wav"
-    wav_path.write_bytes(audio_bytes)
+    (note_dir / f"{note_id}.wav").write_bytes(audio_bytes)
+    np.save(note_dir / f"{note_id}_embed.npy", embeddings)
 
-    # Cached embedding
-    embed_path = note_dir / f"{note_id}_embed.npy"
-    np.save(embed_path, embedding)
-
-    # Metadata
     note_meta = {
         "note_id": note_id,
         "speaker_id": speaker_id,
         "recorded_at": datetime.now().isoformat(),
         "duration_s": round(duration, 2),
         "rms": round(rms, 4),
-        "embedding_norm": round(float(np.linalg.norm(embedding)), 4),
+        "n_windows": int(len(embeddings)),
+        "embed_version": EMBED_VERSION,
         **(metadata or {}),
     }
-
-    meta_path = note_dir / f"{note_id}_meta.json"
-    with open(meta_path, "w") as f:
+    with open(note_dir / f"{note_id}_meta.json", "w") as f:
         json.dump(note_meta, f, indent=2)
 
     logger.info(
-        f"✅ Voice note '{note_id}' added for speaker '{speaker_id}' "
-        f"({duration:.1f}s, emb_norm={note_meta['embedding_norm']:.3f})"
+        f"✅ Voice note '{note_id}' added for '{speaker_id}' "
+        f"({duration:.1f}s, {len(embeddings)} windows)"
     )
     return note_meta
 
 
 def list_voice_notes(speaker_id: str) -> list[dict]:
-    """
-    List all voice notes for a speaker, sorted by recording date.
-    Returns a list of metadata dicts.
-    """
+    """List all voice notes for a speaker, oldest first."""
     note_dir = VOICE_NOTES_DIR / speaker_id
     if not note_dir.exists():
         return []
@@ -139,12 +111,10 @@ def list_voice_notes(speaker_id: str) -> list[dict]:
                 notes.append(json.load(f))
         except (json.JSONDecodeError, OSError) as e:
             logger.warning(f"Skipping corrupted note metadata: {meta_file}: {e}")
-
     return notes
 
 
 def get_voice_note_count(speaker_id: str) -> int:
-    """Count voice notes for a speaker."""
     note_dir = VOICE_NOTES_DIR / speaker_id
     if not note_dir.exists():
         return 0
@@ -166,77 +136,88 @@ def delete_voice_note(speaker_id: str, note_id: str) -> bool:
     return deleted
 
 
-def delete_all_voice_notes(speaker_id: str) -> int:
-    """Delete all voice notes for a speaker. Returns count deleted."""
-    note_dir = VOICE_NOTES_DIR / speaker_id
-    if not note_dir.exists():
-        return 0
-
-    count = 0
-    for f in note_dir.iterdir():
-        if f.is_file():
-            f.unlink()
-            count += 1
-
-    # Remove the empty directory
-    try:
-        note_dir.rmdir()
-    except OSError:
-        pass
-
-    logger.info(f"🗑️ Deleted {count} files for speaker '{speaker_id}'")
-    return count
-
-
 # ─── Embedding Operations ───────────────────────────────────────────────────
 
-def get_speaker_centroid(speaker_id: str) -> np.ndarray | None:
-    """
-    Compute the centroid (L2-normalized average) embedding from all voice notes.
-
-    Used for similarity-based matching before a fine-tuned classifier is available.
-    Returns None if no embeddings are stored.
-    """
-    note_dir = VOICE_NOTES_DIR / speaker_id
-    if not note_dir.exists():
+def _load_note_embeddings(embed_file: Path) -> np.ndarray | None:
+    """Load a note's embeddings as an (n, 192) array of unit vectors."""
+    try:
+        emb = np.load(embed_file).astype(np.float32)
+    except Exception as e:
+        logger.warning(f"Skipping corrupted embedding: {embed_file}: {e}")
         return None
-
-    embeddings = []
-    for embed_file in sorted(note_dir.glob("*_embed.npy")):
-        try:
-            emb = np.load(embed_file)
-            embeddings.append(emb)
-        except Exception as e:
-            logger.warning(f"Skipping corrupted embedding: {embed_file}: {e}")
-
-    if not embeddings:
-        return None
-
-    # Average and L2-normalize
-    centroid = np.mean(embeddings, axis=0).astype(np.float32)
-    norm = np.linalg.norm(centroid)
-    if norm > 0:
-        centroid = centroid / norm
-
-    return centroid
+    if emb.ndim == 1:
+        emb = emb[None, :]
+    norms = np.linalg.norm(emb, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return emb / norms
 
 
-def get_all_embeddings(speaker_id: str) -> list[np.ndarray]:
-    """Load all cached embeddings for a speaker, sorted by filename."""
+def get_note_embeddings(speaker_id: str) -> list[np.ndarray]:
+    """One (n_windows, 192) array per voice note, oldest first."""
     note_dir = VOICE_NOTES_DIR / speaker_id
     if not note_dir.exists():
         return []
-
-    embeddings = []
+    result = []
     for embed_file in sorted(note_dir.glob("*_embed.npy")):
+        emb = _load_note_embeddings(embed_file)
+        if emb is not None and len(emb) > 0:
+            result.append(emb)
+    return result
+
+
+def centroid_of(embeddings: np.ndarray) -> np.ndarray:
+    """Unit-length mean of a stack of unit embeddings."""
+    c = embeddings.mean(axis=0).astype(np.float32)
+    n = np.linalg.norm(c)
+    return c / n if n > 0 else c
+
+
+def get_speaker_centroid(speaker_id: str) -> np.ndarray | None:
+    """
+    The speaker's reference voiceprint: average of all window embeddings from
+    all voice notes (unit length). None if the speaker has no notes.
+    """
+    notes = get_note_embeddings(speaker_id)
+    if not notes:
+        return None
+    return centroid_of(np.concatenate(notes))
+
+
+def upgrade_legacy_notes() -> int:
+    """
+    Re-compute embeddings for notes saved by older versions (one un-normalised
+    embedding of the whole clip) so they use the current per-window format.
+    Needs the encoder; call after it is loaded. Returns number upgraded.
+    """
+    from model_manager import get_window_embeddings
+
+    if not VOICE_NOTES_DIR.exists():
+        return 0
+
+    upgraded = 0
+    for meta_file in VOICE_NOTES_DIR.glob("*/*_meta.json"):
         try:
-            embeddings.append(np.load(embed_file))
+            with open(meta_file) as f:
+                meta = json.load(f)
+            if meta.get("embed_version") == EMBED_VERSION:
+                continue
+
+            note_id = meta["note_id"]
+            wav_path = meta_file.parent / f"{note_id}.wav"
+            audio = load_audio(wav_path.read_bytes(), target_sr=SR)
+            embeddings = get_window_embeddings(audio, SR)
+            if len(embeddings) == 0:
+                logger.warning(f"Could not upgrade '{note_id}': no speech found.")
+                continue
+
+            np.save(meta_file.parent / f"{note_id}_embed.npy", embeddings)
+            meta.pop("embedding_norm", None)
+            meta["n_windows"] = int(len(embeddings))
+            meta["embed_version"] = EMBED_VERSION
+            with open(meta_file, "w") as f:
+                json.dump(meta, f, indent=2)
+            upgraded += 1
+            logger.info(f"⬆️  Upgraded embeddings for '{note_id}'")
         except Exception as e:
-            logger.warning(f"Skipping corrupted embedding: {embed_file}: {e}")
-
-    return embeddings
-
-
-def can_fine_tune(speaker_id: str) -> bool:
-    """Check if a speaker has enough voice notes for fine-tuning."""
-    return get_voice_note_count(speaker_id) >= MIN_NOTES_FOR_FINETUNE
+            logger.error(f"Failed to upgrade {meta_file}: {e}")
+    return upgraded

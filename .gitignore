@@ -1,1 +1,7 @@
-.venv
+.venv/
+__pycache__/
+*.pyc
+
+# Runtime data: downloaded model, personal voice recordings (biometric —
+# never commit), door config and access log. All recreated automatically.
+voiceguard/backend/storage/

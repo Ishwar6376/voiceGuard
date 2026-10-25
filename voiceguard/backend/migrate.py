@@ -8,15 +8,14 @@ Usage:
     python migrate.py
 """
 import logging
-import json
 import sys
 from pathlib import Path
 
 # Ensure backend directory is on path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from audio_processor import load_audio, SR
-from voice_notes import add_voice_note, get_voice_note_count, VOICE_NOTES_DIR
+from voice_notes import add_voice_note, get_voice_note_count
+from calibrator import DEFAULT_THRESHOLD
 from storage import TEMPLATE_DIR, RAW_DIR, load_speaker_profile, save_speaker_profile
 
 logging.basicConfig(
@@ -81,8 +80,8 @@ def migrate():
             # Update speaker profile with v2 fields
             profile = load_speaker_profile(speaker_id)
             if profile:
-                profile.setdefault("similarity_threshold", 0.65)
-                profile.setdefault("classifier_threshold", 0.70)
+                profile["similarity_threshold"] = DEFAULT_THRESHOLD
+                profile["score_version"] = 2
                 save_speaker_profile(speaker_id, profile)
 
             logger.info(

@@ -1,62 +1,69 @@
 """
-main.py — VoiceGuard v2 FastAPI Backend
+main.py — VoiceGuard voice-lock FastAPI backend
 
 Endpoints:
   REST:
     - POST   /enroll                                 — Enroll a new speaker (creates first voice note)
     - GET    /speakers                               — List all speakers
-    - DELETE /speakers/{id}                           — Delete a speaker + all data
-    - POST   /speakers/{id}/voice-notes              — Upload a voice note
+    - DELETE /speakers/{id}                          — Delete a speaker + all data
+    - POST   /speakers/{id}/voice-notes              — Upload a voice note (form field: file)
     - GET    /speakers/{id}/voice-notes              — List voice notes
     - DELETE /speakers/{id}/voice-notes/{note_id}    — Delete a voice note
-    - POST   /speakers/{id}/fine-tune                — Trigger fine-tuning
-    - GET    /speakers/{id}/model-status             — Get model/classifier status
+    - POST   /speakers/{id}/calibrate                — Learn a personal threshold from voice notes
+    - GET    /speakers/{id}/model-status             — Voice note count + calibration status
     - GET    /speakers/{id}/spectrum                 — FFT spectrum of latest voice note
-    - POST   /settings/{id}                          — Update thresholds
-    - GET    /model/status                           — Base model health
-    - GET    /health                                 — Backend health
-    - GET    /alarm/status                           — Alarm status
-    - POST   /alarm/stop                             — Stop alarm
+    - POST   /settings/{id}                          — Update a speaker's similarity threshold
+    - GET    /config, POST /config                   — Door settings (challenge phrase, unlock time)
+    - GET    /lock/status, POST /lock/lock           — Door state / lock immediately
+    - GET    /access-log                             — Recent granted/denied attempts
+    - GET    /model/status, GET /health
 
-  WebSocket:
-    - /listen  — Live audio streaming + speaker verification
+  WebSocket /listen — live audio → speaker identification → door lock
+    client → server:
+      {"type": "start"}
+      {"type": "audio_chunk", "data": <base64 float32 PCM>, "sample_rate": 48000}
+      {"type": "transcript", "text": "..."}          (browser speech-to-text)
+      {"type": "stop"}
+    server → client:
+      status | challenge | phrase_heard | level | match | lock | access | error | ping
 """
 import asyncio
 import base64
 import json
 import logging
+import re
+import threading
 import time
-import io
+from collections import deque
+from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
-import numpy as np
-import soundfile as sf
 import librosa
-
-from fastapi import (
-    FastAPI, File, Form, UploadFile,
-    HTTPException, WebSocket, WebSocketDisconnect,
-)
+import numpy as np
+import soxr
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from audio_processor import load_audio, SR
-from model_manager import get_embedding, cosine_similarity, is_encoder_available, get_model_info
-from alarm_manager import alarm
+from audio_processor import SR
+from calibrator import (
+    DEFAULT_THRESHOLD, MIN_NOTES_FOR_CALIBRATION,
+    calibrate, can_calibrate, get_calibration,
+)
+from challenge import new_phrase, phrase_spoken
+from lock_manager import door
+from model_manager import get_embedding, get_model_info, preload
 from storage import (
-    save_speaker_profile, load_speaker_profile,
-    list_speakers, delete_speaker,
-    save_template, load_template,
+    TEMPLATE_DIR, delete_speaker, list_speakers, load_config,
+    load_speaker_profile, make_speaker_id, save_config, save_speaker_profile,
 )
+from vad import is_speech
 from voice_notes import (
-    add_voice_note, list_voice_notes, get_voice_note_count,
-    delete_voice_note, delete_all_voice_notes,
-    get_speaker_centroid, can_fine_tune,
+    VOICE_NOTES_DIR, add_voice_note, delete_voice_note, get_speaker_centroid,
+    get_voice_note_count, list_voice_notes, upgrade_legacy_notes,
 )
-from fine_tuner import fine_tuner
-from vad import is_voice_present
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,23 +71,78 @@ logging.basicConfig(
 )
 logger = logging.getLogger("voiceguard")
 
-app = FastAPI(title="VoiceGuard API", version="2.0.0")
+# ─── Live verification config ────────────────────────────────────────────────
+WINDOW_DURATION  = 1.5   # seconds of audio per embedding
+OVERLAP_DURATION = 0.75  # seconds shared between consecutive windows
+CHUNK_SR         = 16000
 
+# The door opens when the SAME enrolled speaker wins MATCHES_REQUIRED of the
+# last DECISION_WINDOWS speech windows (all within DECISION_MAX_AGE_S).
+# One lucky window is not enough, which removes most false accepts.
+DECISION_WINDOWS   = 3
+MATCHES_REQUIRED   = 2
+DECISION_MAX_AGE_S = 5.0
+
+# Challenge phrase timing. Speech-to-text reports the phrase ~1 s after it was
+# spoken, so windows from just before are checked too (they're still "recent").
+PHRASE_VALID_S  = 5.0    # heard phrase counts this long
+ATTEMPT_WAIT_S  = 3.0    # after the phrase, wait this long for voice match → else DENIED
+CHALLENGE_TTL_S = 60.0   # unused phrases are replaced after this long
+
+NOTE_ID_RE = re.compile(r"^note_[0-9]{8}_[0-9]{6}_[0-9a-f]{6}$")
+
+
+# ─── Startup ─────────────────────────────────────────────────────────────────
+
+def _upgrade_legacy_profiles():
+    """Profiles from older versions stored thresholds on a different scale."""
+    for meta_file in TEMPLATE_DIR.glob("*_meta.json"):
+        try:
+            with open(meta_file) as f:
+                meta = json.load(f)
+            if meta.get("score_version") == 2:
+                continue
+            for key in ["dtw_threshold", "dl_threshold", "fusion_threshold", "classifier_threshold"]:
+                meta.pop(key, None)
+            meta["similarity_threshold"] = DEFAULT_THRESHOLD
+            meta["score_version"] = 2
+            with open(meta_file, "w") as f:
+                json.dump(meta, f, indent=2)
+            logger.info(f"⬆️  Upgraded profile {meta_file.name} (threshold reset to {DEFAULT_THRESHOLD})")
+        except Exception as e:
+            logger.error(f"Failed to upgrade profile {meta_file}: {e}")
+
+
+def _warmup():
+    """Load the model and upgrade old data without blocking the server."""
+    preload()
+    _upgrade_legacy_profiles()
+    if get_model_info()["encoder_loaded"]:
+        upgrade_legacy_notes()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    threading.Thread(target=_warmup, name="model-warmup", daemon=True).start()
+    yield
+
+
+app = FastAPI(title="VoiceGuard API", version="3.0.0", lifespan=lifespan)
+
+# Only pages served from this laptop may call the API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ─── Sliding window config ───────────────────────────────────────────────────
-WINDOW_DURATION  = 1.5   # seconds
-OVERLAP_DURATION = 0.75  # seconds
-CHUNK_SR         = 16000
 
-# Default thresholds
-DEFAULT_SIMILARITY_THRESHOLD  = 0.65   # cosine similarity (0-1) for centroid matching
-DEFAULT_CLASSIFIER_THRESHOLD  = 0.70   # classifier confidence for fine-tuned matching
+def _require_speaker(speaker_id: str) -> dict:
+    profile = load_speaker_profile(speaker_id)
+    if profile is None:
+        raise HTTPException(404, f"Speaker '{speaker_id}' not enrolled.")
+    return profile
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -91,7 +153,7 @@ DEFAULT_CLASSIFIER_THRESHOLD  = 0.70   # classifier confidence for fine-tuned ma
 async def health():
     return {
         "status": "ok",
-        "dl_encoder": is_encoder_available(),
+        "encoder_loaded": get_model_info()["encoder_loaded"],
         "model_info": get_model_info(),
         "timestamp": datetime.now().isoformat(),
     }
@@ -99,75 +161,53 @@ async def health():
 
 @app.get("/model/status")
 async def model_status():
-    """Get detailed model status."""
     return get_model_info()
 
 
 # ─── Enrollment ──────────────────────────────────────────────────────────────
 
 @app.post("/enroll")
-async def enroll(
-    name: str = Form(...),
-    file: UploadFile = File(...),
-    keyword: str = Form(default=""),
-):
+async def enroll(name: str = Form(...), file: UploadFile = File(...)):
     """
-    Enroll a new speaker from an uploaded WAV file.
+    Enroll a new speaker. The uploaded audio becomes the speaker's first
+    voice note; more can be added via /speakers/{id}/voice-notes.
+    """
+    speaker_id = make_speaker_id(name)
+    if not speaker_id:
+        raise HTTPException(400, "Please use a name containing letters or numbers.")
+    if load_speaker_profile(speaker_id) is not None:
+        raise HTTPException(
+            409,
+            f"'{name}' is already enrolled. Add voice notes to improve it, "
+            f"or delete the speaker first.",
+        )
 
-    The uploaded audio becomes the speaker's FIRST voice note.
-    Additional voice notes can be added later via /speakers/{id}/voice-notes.
-    """
     raw_bytes = await file.read()
 
+    # Validate + embed the audio before creating the profile
     try:
-        audio = load_audio(raw_bytes, target_sr=SR)
-    except Exception as e:
-        raise HTTPException(400, f"Could not read audio file: {e}")
-
-    if len(audio) < SR * 0.5:
-        raise HTTPException(400, "Recording too short. Please record at least 0.5 seconds.")
-
-    # Generate speaker ID from name
-    speaker_id = name.lower().replace(" ", "_").replace("-", "_")
-
-    # Save speaker profile metadata
-    meta = {
-        "name": name,
-        "speaker_id": speaker_id,
-        "keyword": keyword.strip().lower() if keyword else "",
-        "enrolled_at": datetime.now().isoformat(),
-        "similarity_threshold": DEFAULT_SIMILARITY_THRESHOLD,
-        "classifier_threshold": DEFAULT_CLASSIFIER_THRESHOLD,
-        "sample_rate": SR,
-        # Legacy fields for backward compat
-        "dtw_threshold": 0.12,
-        "dl_threshold": 0.72,
-        "fusion_threshold": 0.45,
-    }
-
-    save_speaker_profile(speaker_id, meta)
-
-    # Add the enrollment audio as the FIRST voice note
-    try:
-        note_meta = add_voice_note(
-            speaker_id,
-            raw_bytes,
-            metadata={"source": "enrollment"},
+        note_meta = await asyncio.to_thread(
+            add_voice_note, speaker_id, raw_bytes, {"source": "enrollment"}
         )
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-    logger.info(
-        f"✅ Enrolled speaker '{name}' as '{speaker_id}' — "
-        f"first voice note: {note_meta['note_id']}"
-    )
+    meta = {
+        "name": name.strip(),
+        "speaker_id": speaker_id,
+        "enrolled_at": datetime.now().isoformat(),
+        "similarity_threshold": DEFAULT_THRESHOLD,
+        "score_version": 2,
+        "sample_rate": SR,
+    }
+    save_speaker_profile(speaker_id, meta)
 
+    logger.info(f"✅ Enrolled '{name}' as '{speaker_id}' — first note {note_meta['note_id']}")
     return {
         "success": True,
         "speaker_id": speaker_id,
-        "name": name,
+        "name": meta["name"],
         "first_voice_note": note_meta,
-        "dl_embedding": True,
         "meta": meta,
     }
 
@@ -181,10 +221,7 @@ async def get_speakers():
 
 @app.delete("/speakers/{speaker_id}")
 async def remove_speaker(speaker_id: str):
-    # Also remove fine-tuner cache
-    fine_tuner.delete_classifier(speaker_id)
-    deleted = delete_speaker(speaker_id)
-    if not deleted:
+    if not delete_speaker(speaker_id):
         raise HTTPException(404, f"Speaker '{speaker_id}' not found.")
     return {"success": True, "speaker_id": speaker_id}
 
@@ -193,52 +230,43 @@ async def remove_speaker(speaker_id: str):
 
 @app.post("/speakers/{speaker_id}/voice-notes")
 async def upload_voice_note(speaker_id: str, file: UploadFile = File(...)):
-    """Upload a new voice note for a speaker."""
-    # Verify speaker exists
-    profile = load_speaker_profile(speaker_id)
-    if profile is None:
-        raise HTTPException(404, f"Speaker '{speaker_id}' not enrolled.")
-
+    _require_speaker(speaker_id)
     raw_bytes = await file.read()
 
     try:
-        note_meta = add_voice_note(speaker_id, raw_bytes)
+        note_meta = await asyncio.to_thread(add_voice_note, speaker_id, raw_bytes)
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-    # Return updated counts
     note_count = get_voice_note_count(speaker_id)
-    can_ft = can_fine_tune(speaker_id)
-
     return {
         "success": True,
         "voice_note": note_meta,
         "total_notes": note_count,
-        "can_fine_tune": can_ft,
+        "can_calibrate": can_calibrate(note_count),
     }
 
 
 @app.get("/speakers/{speaker_id}/voice-notes")
 async def get_voice_notes(speaker_id: str):
-    """List all voice notes for a speaker."""
-    profile = load_speaker_profile(speaker_id)
-    if profile is None:
-        raise HTTPException(404, f"Speaker '{speaker_id}' not enrolled.")
-
+    _require_speaker(speaker_id)
     notes = list_voice_notes(speaker_id)
     return {
         "speaker_id": speaker_id,
         "voice_notes": notes,
         "total": len(notes),
-        "can_fine_tune": can_fine_tune(speaker_id),
+        "can_calibrate": can_calibrate(len(notes)),
     }
 
 
 @app.delete("/speakers/{speaker_id}/voice-notes/{note_id}")
 async def remove_voice_note(speaker_id: str, note_id: str):
-    """Delete a single voice note."""
-    deleted = delete_voice_note(speaker_id, note_id)
-    if not deleted:
+    _require_speaker(speaker_id)
+    if not NOTE_ID_RE.match(note_id):
+        raise HTTPException(400, "Invalid note id.")
+    if get_voice_note_count(speaker_id) <= 1:
+        raise HTTPException(400, "Cannot delete the last voice note. Delete the speaker instead.")
+    if not delete_voice_note(speaker_id, note_id):
         raise HTTPException(404, f"Voice note '{note_id}' not found.")
     return {
         "success": True,
@@ -247,58 +275,39 @@ async def remove_voice_note(speaker_id: str, note_id: str):
     }
 
 
-# ─── Fine-Tuning ────────────────────────────────────────────────────────────
+# ─── Calibration ─────────────────────────────────────────────────────────────
 
-@app.post("/speakers/{speaker_id}/fine-tune")
-async def trigger_fine_tune(speaker_id: str):
-    """Trigger fine-tuning of the classification head for a speaker."""
-    profile = load_speaker_profile(speaker_id)
-    if profile is None:
-        raise HTTPException(404, f"Speaker '{speaker_id}' not enrolled.")
-
-    if fine_tuner.is_training:
-        raise HTTPException(409, "Fine-tuning is already in progress. Please wait.")
-
-    if not can_fine_tune(speaker_id):
-        note_count = get_voice_note_count(speaker_id)
-        raise HTTPException(
-            400,
-            f"Need at least 5 voice notes to fine-tune. Currently have {note_count}.",
-        )
-
-    # Run fine-tuning in a thread to avoid blocking
-    loop = asyncio.get_event_loop()
+@app.post("/speakers/{speaker_id}/calibrate")
+async def trigger_calibration(speaker_id: str):
+    """Learn a personal similarity threshold from the speaker's voice notes."""
+    profile = _require_speaker(speaker_id)
     try:
-        result = await loop.run_in_executor(
-            None, fine_tuner.run_fine_tune, speaker_id
-        )
+        result = await asyncio.to_thread(calibrate, speaker_id)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    except Exception as e:
-        logger.error(f"Fine-tuning failed: {e}", exc_info=True)
-        raise HTTPException(500, f"Fine-tuning failed: {e}")
 
-    return result
+    profile["similarity_threshold"] = result["threshold"]
+    save_speaker_profile(speaker_id, profile)
+    return {"success": True, **result}
 
 
 @app.get("/speakers/{speaker_id}/model-status")
 async def speaker_model_status(speaker_id: str):
-    """Get model/classifier status for a specific speaker."""
-    profile = load_speaker_profile(speaker_id)
-    if profile is None:
-        raise HTTPException(404, f"Speaker '{speaker_id}' not enrolled.")
-
+    profile = _require_speaker(speaker_id)
     note_count = get_voice_note_count(speaker_id)
-    has_clf = fine_tuner.has_classifier(speaker_id)
-    clf_config = fine_tuner.get_config(speaker_id)
+    calibration = get_calibration(speaker_id)
 
     return {
         "speaker_id": speaker_id,
         "voice_note_count": note_count,
-        "can_fine_tune": can_fine_tune(speaker_id),
-        "has_classifier": has_clf,
-        "classifier_config": clf_config,
-        "matching_mode": "classifier" if has_clf else "similarity",
+        "min_notes_for_calibration": MIN_NOTES_FOR_CALIBRATION,
+        "can_calibrate": can_calibrate(note_count),
+        "calibrated": calibration is not None,
+        # Notes were added/removed since calibrating → should recalibrate
+        "calibration_stale": bool(calibration and calibration["n_notes"] != note_count),
+        "calibration": calibration,
+        "similarity_threshold": profile.get("similarity_threshold", DEFAULT_THRESHOLD),
+        "default_threshold": DEFAULT_THRESHOLD,
         "base_model": get_model_info(),
     }
 
@@ -308,53 +317,29 @@ async def speaker_model_status(speaker_id: str):
 @app.get("/speakers/{speaker_id}/spectrum")
 async def get_spectrum(speaker_id: str):
     """
-    Compute the time-averaged magnitude spectrum of the speaker's voice.
-    Uses the latest voice note, or falls back to legacy enrollment audio.
+    Time-averaged magnitude spectrum of the speaker's latest voice note.
     Returns 128 bins (normalized 0–1) for the frontend FFT overlay.
     """
-    from pathlib import Path
+    _require_speaker(speaker_id)
 
-    # Try latest voice note first
-    audio = None
     notes = list_voice_notes(speaker_id)
-    if notes:
-        latest_note = notes[-1]
-        note_path = (
-            Path(__file__).parent / "storage" / "voice_notes"
-            / speaker_id / f"{latest_note['note_id']}.wav"
-        )
-        if note_path.exists():
-            try:
-                audio, sr = librosa.load(str(note_path), sr=16000, mono=True)
-            except Exception:
-                pass
-
-    # Fallback to legacy enrollment
-    if audio is None or len(audio) == 0:
-        raw_path = Path(__file__).parent / "storage" / "raw" / f"{speaker_id}_enrollment.wav"
-        if raw_path.exists():
-            try:
-                audio, sr = librosa.load(str(raw_path), sr=16000, mono=True)
-            except Exception as e:
-                raise HTTPException(500, f"Could not load audio: {e}")
-
-    if audio is None or len(audio) == 0:
+    if not notes:
         raise HTTPException(404, "No audio found for this speaker.")
 
-    # STFT → average magnitude
-    n_fft = 1024
-    hop_length = 256
-    mag = np.abs(librosa.stft(audio, n_fft=n_fft, hop_length=hop_length))
-    avg = mag.mean(axis=1)
+    note_path = VOICE_NOTES_DIR / speaker_id / f"{notes[-1]['note_id']}.wav"
+    try:
+        audio, _ = librosa.load(str(note_path), sr=16000, mono=True)
+    except Exception as e:
+        raise HTTPException(500, f"Could not load audio: {e}")
 
+    mag = np.abs(librosa.stft(audio, n_fft=1024, hop_length=256))
+    avg = mag.mean(axis=1)
     peak = float(avg.max())
     if peak > 0:
         avg = avg / peak
 
-    # Downsample to 128 bins
     TARGET = 128
-    indices = np.linspace(0, len(avg) - 1, TARGET).astype(int)
-    spectrum = avg[indices]
+    spectrum = avg[np.linspace(0, len(avg) - 1, TARGET).astype(int)]
 
     return {
         "speaker_id": speaker_id,
@@ -364,281 +349,332 @@ async def get_spectrum(speaker_id: str):
     }
 
 
-# ─── Alarm ───────────────────────────────────────────────────────────────────
-
-@app.get("/alarm/status")
-async def alarm_status():
-    return alarm.status()
-
-
-@app.post("/alarm/stop")
-async def stop_alarm():
-    alarm.stop()
-    return {"success": True, "message": "Alarm stopped."}
-
-
 # ─── Settings ────────────────────────────────────────────────────────────────
 
 @app.post("/settings/{speaker_id}")
 async def update_settings(speaker_id: str, settings: dict):
-    """Update thresholds for a speaker."""
-    profile = load_speaker_profile(speaker_id)
-    if profile is None:
-        raise HTTPException(404, "Speaker not found.")
+    profile = _require_speaker(speaker_id)
 
-    # Update allowed keys
-    allowed = [
-        "similarity_threshold", "classifier_threshold",
-        "dtw_threshold", "dl_threshold", "fusion_threshold",
-    ]
-    for key in allowed:
-        if key in settings:
-            profile[key] = float(settings[key])
+    if "similarity_threshold" in settings:
+        try:
+            value = float(settings["similarity_threshold"])
+        except (TypeError, ValueError):
+            raise HTTPException(400, "similarity_threshold must be a number.")
+        if not 0.0 < value < 1.0:
+            raise HTTPException(400, "similarity_threshold must be between 0 and 1.")
+        profile["similarity_threshold"] = round(value, 4)
 
     save_speaker_profile(speaker_id, profile)
     return {"success": True, "updated": profile}
 
 
+@app.get("/config")
+async def get_config():
+    return load_config()
+
+
+@app.post("/config")
+async def update_config(settings: dict):
+    cfg = load_config()
+    if "require_challenge" in settings:
+        cfg["require_challenge"] = bool(settings["require_challenge"])
+    if "unlock_seconds" in settings:
+        try:
+            seconds = float(settings["unlock_seconds"])
+        except (TypeError, ValueError):
+            raise HTTPException(400, "unlock_seconds must be a number.")
+        if not 1 <= seconds <= 60:
+            raise HTTPException(400, "unlock_seconds must be between 1 and 60.")
+        cfg["unlock_seconds"] = seconds
+    save_config(cfg)
+    return cfg
+
+
+# ─── Lock ────────────────────────────────────────────────────────────────────
+
+@app.get("/lock/status")
+async def lock_status():
+    return door.status()
+
+
+@app.post("/lock/lock")
+async def lock_now():
+    door.lock("manual")
+    return door.status()
+
+
+@app.get("/access-log")
+async def access_log():
+    return {"events": door.recent_events()}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# WEBSOCKET: LIVE LISTENING
+# WEBSOCKET: LIVE LISTENING → DOOR LOCK
 # ══════════════════════════════════════════════════════════════════════════════
 
-active_connections: list[WebSocket] = []
+def _load_references() -> list[dict]:
+    """Voiceprint + threshold of every enrolled speaker that has voice notes."""
+    refs = []
+    for s in list_speakers():
+        centroid = get_speaker_centroid(s["id"])
+        if centroid is not None:
+            refs.append({
+                "id": s["id"],
+                "name": s["name"],
+                "threshold": float(s["similarity_threshold"]),
+                "calibrated": s["calibrated"],
+                "centroid": centroid,
+            })
+    return refs
+
+
+def _score_window(window: np.ndarray, centroids: np.ndarray) -> Optional[np.ndarray]:
+    """Speech check + embedding + similarity to every speaker. Runs in a worker thread."""
+    if not is_speech(window, CHUNK_SR):
+        return None
+    emb = get_embedding(window, CHUNK_SR)
+    if emb is None:
+        return None
+    return centroids @ emb  # both unit length → cosine similarity per speaker
 
 
 @app.websocket("/listen")
 async def listen_ws(ws: WebSocket):
     await ws.accept()
-    active_connections.append(ws)
     logger.info("WebSocket connected.")
 
-    # Per-connection state
-    audio_buffer = np.array([], dtype=np.float32)
-    speaker_id: Optional[str] = None
-    speaker_profile: Optional[dict] = None
-    centroid: Optional[np.ndarray] = None
+    refs: list[dict] = []
+    centroids: Optional[np.ndarray] = None
+    thresholds: Optional[np.ndarray] = None
+    cfg = load_config()
     listening = False
 
-    # Text filter gate
-    text_gate_open = False
-    keyword: str = ""
+    audio_buffer = np.array([], dtype=np.float32)
+    resampler = None
+    resampler_sr = None
+
+    # Recent speech windows: (time, index of matched speaker or None, best score, best index)
+    recent: deque = deque(maxlen=DECISION_WINDOWS)
+
+    phrase: Optional[str] = None
+    phrase_issued_at = 0.0
+    phrase_heard_at: Optional[float] = None
+    attempt_deadline: Optional[float] = None
 
     window_samples = int(WINDOW_DURATION * CHUNK_SR)
-    overlap_samples = int(OVERLAP_DURATION * CHUNK_SR)
-    step_samples = window_samples - overlap_samples
+    step_samples = window_samples - int(OVERLAP_DURATION * CHUNK_SR)
 
-    # Alarm listener for this connection
-    async def send_alarm(msg: dict):
+    async def send(msg: dict):
+        await ws.send_text(json.dumps(msg))
+
+    async def on_door_event(msg: dict):
         try:
-            await ws.send_text(json.dumps(msg))
+            await send(msg)
         except Exception:
             pass
 
-    alarm.add_listener(send_alarm)
+    async def new_challenge():
+        nonlocal phrase, phrase_issued_at, phrase_heard_at, attempt_deadline
+        phrase = new_phrase() if cfg["require_challenge"] else None
+        phrase_issued_at = time.monotonic()
+        phrase_heard_at = None
+        attempt_deadline = None
+        await send({"type": "challenge", "phrase": phrase, "expires_in": CHALLENGE_TTL_S})
+
+    def voice_leader() -> tuple[Optional[int], int, float]:
+        """Speaker who matched most recent windows: (index, n_matches, best score)."""
+        now = time.monotonic()
+        counts: dict[int, int] = {}
+        best: dict[int, float] = {}
+        for t, idx, score, _ in recent:
+            if idx is not None and now - t <= DECISION_MAX_AGE_S:
+                counts[idx] = counts.get(idx, 0) + 1
+                best[idx] = max(best.get(idx, 0.0), score)
+        if not counts:
+            return None, 0, 0.0
+        idx = max(counts, key=lambda i: (counts[i], best[i]))
+        return idx, counts[idx], best[idx]
+
+    def phrase_ok() -> bool:
+        if not cfg["require_challenge"]:
+            return True
+        return phrase_heard_at is not None and time.monotonic() - phrase_heard_at <= PHRASE_VALID_S
+
+    async def evaluate():
+        """Unlock, deny, or keep waiting."""
+        if not door.is_locked:
+            return
+
+        idx, n_match, score = voice_leader()
+        if idx is not None and n_match >= MATCHES_REQUIRED and phrase_ok():
+            door.unlock(refs[idx]["id"], refs[idx]["name"], score, cfg["unlock_seconds"])
+            recent.clear()
+            if cfg["require_challenge"]:
+                await new_challenge()
+            return
+
+        if attempt_deadline is not None and time.monotonic() > attempt_deadline:
+            # Phrase was spoken, but the voice didn't match anyone enrolled
+            now = time.monotonic()
+            scored = [(s, b) for t, _, s, b in recent if now - t <= DECISION_MAX_AGE_S]
+            if scored:
+                s, b = max(scored)
+                door.record("denied", reason="voice not recognised",
+                            closest=refs[b]["name"], score=s,
+                            threshold=refs[b]["threshold"])
+            else:
+                door.record("denied", reason="no clear speech heard")
+            recent.clear()
+            await new_challenge()
+
+    door.add_listener(on_door_event)
 
     try:
         while True:
             try:
                 raw = await asyncio.wait_for(ws.receive_text(), timeout=30.0)
             except asyncio.TimeoutError:
-                await ws.send_text(json.dumps({"type": "ping"}))
+                await send({"type": "ping"})
                 continue
 
-            msg = json.loads(raw)
+            try:
+                msg = json.loads(raw)
+                msg_type = msg["type"]
+            except (json.JSONDecodeError, KeyError, TypeError):
+                await send({"type": "error", "message": "Malformed message."})
+                continue
 
             # ── START ────────────────────────────────────────────────────
-            if msg["type"] == "start":
-                speaker_id = msg.get("speaker_id")
-
-                # Load speaker profile
-                speaker_profile = load_speaker_profile(speaker_id)
-                if speaker_profile is None:
-                    await ws.send_text(json.dumps({
-                        "type": "error",
-                        "message": f"Speaker '{speaker_id}' not enrolled.",
-                    }))
+            if msg_type == "start":
+                refs = await asyncio.to_thread(_load_references)
+                if not refs:
+                    await send({"type": "error", "message": "No speakers enrolled yet. Enroll someone first."})
                     continue
 
-                # Load centroid embedding for similarity matching
-                centroid = get_speaker_centroid(speaker_id)
-                if centroid is None:
-                    await ws.send_text(json.dumps({
-                        "type": "error",
-                        "message": f"No voice notes found for '{speaker_id}'. Please add voice notes first.",
-                    }))
-                    continue
-
-                # Keyword setup
-                keyword = speaker_profile.get("keyword", "").strip().lower()
-                if msg.get("keyword"):
-                    keyword = msg["keyword"].strip().lower()
-
-                text_gate_open = False
-                listening = True
+                centroids = np.stack([r["centroid"] for r in refs])
+                thresholds = np.array([r["threshold"] for r in refs])
+                cfg = load_config()
+                recent.clear()
                 audio_buffer = np.array([], dtype=np.float32)
+                resampler = None
+                listening = True
 
-                # Determine matching mode
-                has_classifier = fine_tuner.has_classifier(speaker_id)
-                matching_mode = "classifier" if has_classifier else "similarity"
-                note_count = get_voice_note_count(speaker_id)
-
-                await ws.send_text(json.dumps({
+                await send({
                     "type": "status",
                     "listening": True,
-                    "speaker": speaker_id,
-                    "keyword": keyword,
-                    "matching_mode": matching_mode,
-                    "voice_note_count": note_count,
-                    "has_classifier": has_classifier,
-                }))
+                    "speakers": [
+                        {k: r[k] for k in ("id", "name", "threshold", "calibrated")} for r in refs
+                    ],
+                    "require_challenge": cfg["require_challenge"],
+                    "unlock_seconds": cfg["unlock_seconds"],
+                    "matches_required": MATCHES_REQUIRED,
+                    "decision_windows": DECISION_WINDOWS,
+                })
+                await send({"type": "lock", **door.status()})
+                await new_challenge()
                 logger.info(
-                    f"Listening for speaker: {speaker_id}, "
-                    f"keyword: '{keyword}', mode: {matching_mode}"
+                    f"Listening for {len(refs)} speaker(s): {[r['name'] for r in refs]}, "
+                    f"challenge phrase {'ON' if cfg['require_challenge'] else 'OFF'}"
                 )
 
-            # ── TEXT MATCH ───────────────────────────────────────────────
-            elif msg["type"] == "text_match":
-                matched_keyword = msg.get("matched", False)
-                transcript = msg.get("transcript", "")
-                text_gate_open = bool(matched_keyword)
-                logger.debug(
-                    f"Text gate {'OPEN' if text_gate_open else 'CLOSED'} "
-                    f"— transcript: '{transcript}'"
-                )
-                await ws.send_text(json.dumps({
-                    "type": "text_gate",
-                    "open": text_gate_open,
-                    "transcript": transcript,
-                }))
+            # ── SPEECH-TO-TEXT FROM BROWSER ──────────────────────────────
+            elif msg_type == "transcript":
+                if (listening and phrase and phrase_heard_at is None and door.is_locked
+                        and phrase_spoken(str(msg.get("text", "")), phrase)):
+                    phrase_heard_at = time.monotonic()
+                    attempt_deadline = phrase_heard_at + ATTEMPT_WAIT_S
+                    logger.info(f"Challenge phrase heard: '{msg.get('text')}'")
+                    await send({"type": "phrase_heard", "phrase": phrase})
+                    await evaluate()
 
             # ── STOP ─────────────────────────────────────────────────────
-            elif msg["type"] == "stop":
+            elif msg_type == "stop":
                 listening = False
-                text_gate_open = False
+                recent.clear()
                 audio_buffer = np.array([], dtype=np.float32)
-                await ws.send_text(json.dumps({"type": "status", "listening": False}))
+                await send({"type": "status", "listening": False})
 
             # ── AUDIO CHUNK ──────────────────────────────────────────────
-            elif msg["type"] == "audio_chunk" and listening:
-                # Decode incoming base64 PCM float32 chunk
-                chunk_bytes = base64.b64decode(msg["data"])
-                chunk = np.frombuffer(chunk_bytes, dtype=np.float32)
+            elif msg_type == "audio_chunk" and listening:
+                chunk = np.frombuffer(base64.b64decode(msg["data"]), dtype=np.float32)
 
-                # Resample if client sends different SR
-                client_sr = msg.get("sample_rate", CHUNK_SR)
+                client_sr = int(msg.get("sample_rate", CHUNK_SR))
                 if client_sr != CHUNK_SR:
-                    chunk = librosa.resample(
-                        chunk, orig_sr=client_sr, target_sr=CHUNK_SR
-                    )
+                    # Streaming resampler keeps state between chunks (no clicks at edges)
+                    if resampler is None or resampler_sr != client_sr:
+                        resampler = soxr.ResampleStream(client_sr, CHUNK_SR, 1, dtype="float32")
+                        resampler_sr = client_sr
+                    chunk = resampler.resample_chunk(chunk)
 
-                audio_buffer = np.append(audio_buffer, chunk)
+                audio_buffer = np.concatenate([audio_buffer, chunk])
+                # Never let the backlog grow unbounded if processing falls behind
+                if len(audio_buffer) > 4 * window_samples:
+                    audio_buffer = audio_buffer[-2 * window_samples:]
 
-                # Send live RMS + VAD
-                rms = float(np.sqrt(np.mean(chunk ** 2))) if len(chunk) > 0 else 0.0
-                voice = bool(is_voice_present(chunk, CHUNK_SR))
-                await ws.send_text(json.dumps({
+                rms = float(np.sqrt(np.mean(chunk ** 2))) if len(chunk) else 0.0
+                await send({
                     "type": "level",
                     "rms": round(rms, 4),
-                    "voice": voice,
-                }))
+                    "voice": bool(len(chunk) and is_speech(chunk, CHUNK_SR, min_voiced_s=0)),
+                })
 
-                # Process sliding windows
                 while len(audio_buffer) >= window_samples:
                     window = audio_buffer[:window_samples]
                     audio_buffer = audio_buffer[step_samples:]
 
-                    # Skip silent windows
-                    if not is_voice_present(window, CHUNK_SR):
-                        continue
+                    scores = await asyncio.to_thread(_score_window, window, centroids)
+                    if scores is None:
+                        continue  # silence / noise — not scored
 
-                    # ── Text keyword gate ─────────────────────────────────
-                    if keyword and not text_gate_open:
-                        await ws.send_text(json.dumps({
-                            "type": "gate_blocked",
-                            "reason": "keyword_not_detected",
-                            "keyword": keyword,
-                        }))
-                        continue
+                    best = int(np.argmax(scores))
+                    matched = bool(scores[best] >= thresholds[best])
+                    recent.append((time.monotonic(), best if matched else None, float(scores[best]), best))
+                    leader, n_match, _ = voice_leader()
 
-                    # ── Speaker verification (new DL pipeline) ────────────
-                    live_embedding = get_embedding(window, CHUNK_SR)
-                    if live_embedding is None:
-                        continue  # skip if embedding extraction fails
-
-                    # Cosine similarity against centroid (always computed)
-                    similarity_score = cosine_similarity(centroid, live_embedding)
-
-                    # Classifier prediction (if fine-tuned model exists)
-                    classifier_result = fine_tuner.predict(speaker_id, live_embedding)
-
-                    # Determine match based on available method
-                    if classifier_result is not None:
-                        # Fine-tuned classifier available → use it
-                        threshold = speaker_profile.get(
-                            "classifier_threshold",
-                            DEFAULT_CLASSIFIER_THRESHOLD,
-                        )
-                        confidence = classifier_result["confidence"]
-                        matched = confidence >= threshold
-                        primary_score = confidence
-                        matching_mode = "classifier"
-                    else:
-                        # Centroid similarity only
-                        threshold = speaker_profile.get(
-                            "similarity_threshold",
-                            DEFAULT_SIMILARITY_THRESHOLD,
-                        )
-                        matched = similarity_score >= threshold
-                        primary_score = similarity_score
-                        confidence = 0.0
-                        matching_mode = "similarity"
-
-                    logger.debug(
-                        f"Window — sim: {similarity_score:.3f}, "
-                        f"clf: {confidence:.3f}, "
-                        f"mode: {matching_mode}, match: {matched}"
-                    )
-
-                    await ws.send_text(json.dumps({
+                    await send({
                         "type": "match",
-                        "speaker": speaker_id,
-                        "similarity_score": round(float(similarity_score), 4),
-                        "classifier_score": round(float(confidence), 4) if classifier_result else None,
-                        "fusion_score": round(float(primary_score), 4),
-                        "matched": bool(matched),
-                        "matching_mode": matching_mode,
+                        "best_speaker": refs[best]["id"],
+                        "best_name": refs[best]["name"],
+                        "similarity_score": round(float(scores[best]), 4),
+                        "threshold": round(float(thresholds[best]), 4),
+                        "matched": matched,
+                        "scores": {r["name"]: round(float(s), 4) for r, s in zip(refs, scores)},
+                        "leader": refs[leader]["name"] if leader is not None else None,
+                        "recent_matches": n_match,
+                        "matches_required": MATCHES_REQUIRED,
+                        "phrase_required": cfg["require_challenge"],
+                        "phrase_ok": phrase_ok(),
                         "timestamp": datetime.now().isoformat(),
-                        # Legacy compat fields
-                        "dl_score": round(float(similarity_score), 4),
-                        "dtw_dist": 0.0,
-                        "dtw_score": 0.0,
-                    }))
+                    })
 
-                    if matched and not alarm.is_active:
-                        alarm.trigger(speaker_id, primary_score, similarity_score)
+                    await evaluate()
+
+                # Time-based checks (run on every chunk, ~10× per second)
+                if attempt_deadline is not None:
+                    await evaluate()
+                elif phrase and time.monotonic() - phrase_issued_at > CHALLENGE_TTL_S:
+                    await new_challenge()
 
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected.")
     except Exception as e:
         logger.error(f"WebSocket error: {e}", exc_info=True)
     finally:
-        alarm.remove_listener(send_alarm)
-        if ws in active_connections:
-            active_connections.remove(ws)
+        door.remove_listener(on_door_event)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SERVE FRONTEND
 # ══════════════════════════════════════════════════════════════════════════════
 
-import os
-
-frontend_path = os.path.join(os.path.dirname(__file__), "..", "frontend")
-if os.path.exists(frontend_path):
-    app.mount("/", StaticFiles(directory=frontend_path, html=True), name="frontend")
+frontend_path = Path(__file__).parent.parent / "frontend"
+if frontend_path.exists():
+    app.mount("/", StaticFiles(directory=str(frontend_path), html=True), name="frontend")
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, log_level="info")
+    # 127.0.0.1 = reachable only from this laptop, so nobody else on the
+    # Wi-Fi can enroll their voice or unlock the door.
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, log_level="info")

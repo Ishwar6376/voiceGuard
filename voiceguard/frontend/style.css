@@ -537,67 +537,112 @@ body {
 .info-val.ok { color: var(--c-success); }
 .info-val.warn { color: var(--c-warning); }
 
-/* ── Alarm Overlay ────────────────────────────────────────── */
-.alarm-overlay {
-  position: fixed; inset: 0; z-index: 1000;
-  display: flex; align-items: center; justify-content: center;
-  background: rgba(7,11,20,0.85);
-  backdrop-filter: blur(10px);
-  animation: alarmFadeIn 0.3s ease;
+/* ── Door Page ────────────────────────────────────────────── */
+.door-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
 }
-.alarm-overlay.hidden { display: none; }
+/* Cards flow in HTML order: lock + who-is-speaking, then meters, then logs */
+.door-grid > .card { grid-column: auto; grid-row: auto; }
+@media (max-width: 900px) { .door-grid { grid-template-columns: 1fr; } }
 
-@keyframes alarmFadeIn { from{opacity:0} to{opacity:1} }
+.door-card { display: flex; flex-direction: column; gap: 16px; }
 
-.alarm-content {
-  text-align: center; position: relative;
-  padding: 48px 56px;
-  border-radius: var(--radius-xl);
-  background: rgba(255,23,68,0.08);
-  border: 2px solid rgba(255,23,68,0.4);
-  box-shadow: 0 0 80px rgba(255,23,68,0.3), var(--shadow-glass);
-  animation: alarmPop 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+.door-panel {
+  text-align: center;
+  padding: 28px 16px;
+  border-radius: var(--radius-lg);
+  border: 2px solid var(--c-border-2);
+  transition: all 0.4s ease;
 }
-@keyframes alarmPop {
-  from { transform: scale(0.7); opacity: 0; }
-  to   { transform: scale(1); opacity: 1; }
+.door-panel.locked {
+  background: rgba(255,23,68,0.06);
+  border-color: rgba(255,23,68,0.35);
 }
-
-.alarm-pulse-ring {
-  position: absolute; inset: -20px; border-radius: var(--radius-xl);
-  border: 2px solid rgba(255,23,68,0.5);
-  animation: alarmRingPulse 1.5s ease-out infinite;
+.door-panel.unlocked {
+  background: rgba(0,230,118,0.10);
+  border-color: var(--c-success);
+  box-shadow: 0 0 40px rgba(0,230,118,0.25);
 }
-@keyframes alarmRingPulse {
-  0%   { transform: scale(1); opacity: 0.8; }
-  100% { transform: scale(1.15); opacity: 0; }
-}
-
-.alarm-icon { font-size: 56px; animation: alarmShake 0.5s ease-in-out infinite alternate; }
-@keyframes alarmShake {
-  from { transform: rotate(-8deg); }
-  to   { transform: rotate(8deg); }
+.door-panel.denied { animation: doorShake 0.4s ease; border-color: var(--c-danger); }
+@keyframes doorShake {
+  0%, 100% { transform: translateX(0); }
+  20%, 60% { transform: translateX(-8px); }
+  40%, 80% { transform: translateX(8px); }
 }
 
-.alarm-title {
-  font-size: 28px; font-weight: 800; letter-spacing: 2px;
-  color: var(--c-danger); margin: 12px 0 6px;
-  text-shadow: 0 0 30px rgba(255,23,68,0.8);
+.lock-icon  { font-size: 64px; line-height: 1.1; }
+.lock-state {
+  font-size: 26px; font-weight: 800; letter-spacing: 3px; margin: 6px 0;
 }
-.alarm-speaker { color: var(--c-text-muted); font-size: 15px; margin-bottom: 16px; }
-.alarm-scores  { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--c-text-dim); margin-bottom: 24px; }
+.door-panel.locked   .lock-state { color: var(--c-danger); }
+.door-panel.unlocked .lock-state { color: var(--c-success); }
+.lock-detail { color: var(--c-text-muted); font-size: 13px; min-height: 20px; }
 
-.btn-alarm-stop {
-  padding: 13px 40px; border: 2px solid var(--c-danger);
-  background: rgba(255,23,68,0.15); border-radius: 50px;
-  color: var(--c-danger); font-family: inherit;
-  font-size: 15px; font-weight: 700; cursor: pointer;
+.challenge-box {
+  text-align: center;
+  padding: 16px;
+  border-radius: var(--radius-md);
+  background: rgba(255,215,64,0.08);
+  border: 1px dashed rgba(255,215,64,0.45);
+}
+.challenge-label {
+  font-size: 11px; font-weight: 600; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--c-text-dim);
+}
+.challenge-phrase {
+  font-size: 28px; font-weight: 700; color: var(--c-warning);
+  letter-spacing: 1px; margin-top: 4px;
+}
+
+.btn-secondary {
+  padding: 10px 20px; border-radius: 50px;
+  border: 1px solid var(--c-border-2); background: var(--c-surface-2);
+  color: var(--c-text); font-family: inherit; font-weight: 600; cursor: pointer;
   transition: all var(--transition);
 }
-.btn-alarm-stop:hover {
-  background: var(--c-danger); color: #fff;
-  box-shadow: 0 0 30px var(--c-danger-glow);
+.btn-secondary:hover { border-color: var(--c-accent); }
+
+.live-speaker {
+  font-size: 18px; font-weight: 700; margin-bottom: 14px;
+  color: var(--c-text-muted);
 }
+.live-speaker.known   { color: var(--c-success); }
+.live-speaker.unknown { color: var(--c-warning); }
+
+.all-scores { margin-top: 16px; display: flex; flex-direction: column; gap: 6px; }
+.score-row {
+  display: grid; grid-template-columns: 90px 1fr 40px; align-items: center; gap: 8px;
+  font-size: 12px; color: var(--c-text-muted);
+}
+.score-row span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.score-row-bar {
+  height: 6px; border-radius: 50px; background: rgba(255,255,255,0.08); overflow: hidden;
+}
+.score-row-bar span { display: block; height: 100%; background: var(--gradient-dl); }
+.score-row-val { font-family: 'JetBrains Mono', monospace; text-align: right; }
+
+.log-entry.denied { border-color: var(--c-danger); background: rgba(255,23,68,0.06); }
+
+.card-title-hint { font-weight: 400; font-size: 11px; color: var(--c-text-dim); }
+
+/* ── Read-aloud prompt (enroll / voice notes) ─────────────── */
+.read-prompt {
+  margin-bottom: 16px; padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: rgba(0,229,255,0.06);
+  border: 1px solid rgba(0,229,255,0.25);
+}
+.read-prompt-label { font-size: 11px; font-weight: 600; color: var(--c-accent); margin-bottom: 4px; }
+.read-prompt-text  { font-size: 14px; line-height: 1.5; color: var(--c-text); }
+
+/* ── Settings toggle ──────────────────────────────────────── */
+.toggle-row {
+  display: flex; gap: 12px; align-items: flex-start;
+  margin-bottom: 20px; cursor: pointer; font-size: 13px;
+}
+.toggle-row input { margin-top: 4px; width: 16px; height: 16px; accent-color: var(--c-primary); }
 
 /* ── Utility ──────────────────────────────────────────────── */
 .hidden { display: none !important; }

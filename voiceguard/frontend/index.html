@@ -3,12 +3,13 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>VoiceGuard v2 — Deep Learning Voice Alarm</title>
-  <meta name="description" content="Enroll your voice, add voice notes to improve accuracy, fine-tune your personal model, and trigger alarms with keyword detection. Powered by ECAPA-TDNN deep learning." />
+  <title>VoiceGuard — Voice Lock</title>
+  <meta name="description" content="A door lock that opens only for enrolled voices, using ECAPA-TDNN speaker recognition and a random spoken challenge phrase." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="style.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔒</text></svg>" />
 </head>
 <body>
   <!-- Background -->
@@ -17,18 +18,6 @@
   <div class="bg-orb orb-2"></div>
   <div class="bg-orb orb-3"></div>
 
-  <!-- Alarm Overlay -->
-  <div id="alarm-overlay" class="alarm-overlay hidden">
-    <div class="alarm-content">
-      <div class="alarm-pulse-ring"></div>
-      <div class="alarm-icon">🚨</div>
-      <h2 class="alarm-title">ALARM TRIGGERED</h2>
-      <p class="alarm-speaker" id="alarm-speaker-name">Keyword detected!</p>
-      <div class="alarm-scores" id="alarm-scores"></div>
-      <button id="alarm-stop-btn" class="btn-alarm-stop">Stop Alarm</button>
-    </div>
-  </div>
-
   <!-- App Shell -->
   <div class="app">
     <!-- Sidebar -->
@@ -36,7 +25,7 @@
       <div class="logo">
         <span class="logo-icon">🎙️</span>
         <span class="logo-text">VoiceGuard</span>
-        <span class="logo-version">v2</span>
+        <span class="logo-version">v3</span>
       </div>
       <nav class="nav">
         <button id="nav-enroll"  class="nav-item active" data-page="enroll">
@@ -48,8 +37,8 @@
           <span class="nav-label">Voice Notes</span>
         </button>
         <button id="nav-monitor" class="nav-item" data-page="monitor">
-          <span class="nav-icon">📡</span>
-          <span class="nav-label">Monitor</span>
+          <span class="nav-icon">🚪</span>
+          <span class="nav-label">Door</span>
         </button>
         <button id="nav-settings" class="nav-item" data-page="settings">
           <span class="nav-icon">⚙️</span>
@@ -68,32 +57,30 @@
       <section id="page-enroll" class="page active">
         <div class="page-header">
           <h1>Enroll Speaker</h1>
-          <p class="page-subtitle">Record your voice — this becomes your first voice note. Add more notes later to improve accuracy.</p>
+          <p class="page-subtitle">Record 5–8 seconds of continuous speech — this becomes your first voice note.</p>
         </div>
 
         <div class="enroll-grid">
           <!-- Record Card -->
           <div class="card glass record-card">
-            <h2 class="card-title">Record Keyword</h2>
+            <h2 class="card-title">Record Your Voice</h2>
 
             <div class="form-group">
               <label for="speaker-name" class="form-label">Speaker Name</label>
               <input type="text" id="speaker-name" class="form-input" placeholder='e.g. Ishwar' maxlength="32" />
             </div>
 
-            <div class="form-group">
-              <label for="speaker-keyword" class="form-label">Keyword / Trigger Phrase
-                <span class="form-label-hint">— exact phrase to detect (e.g. &ldquo;open sesame&rdquo;)</span>
-              </label>
-              <input type="text" id="speaker-keyword" class="form-input" placeholder='e.g. open sesame' maxlength="64" />
+            <div class="read-prompt">
+              <div class="read-prompt-label">📖 Read this aloud, without long pauses</div>
+              <div class="read-prompt-text">"The morning sun rose slowly over the quiet village, and the children walked together to the old school near the river."</div>
             </div>
 
             <div class="form-group">
               <label class="form-label">Duration</label>
               <div class="duration-chips">
-                <button class="chip" data-duration="2">2s</button>
-                <button class="chip active" data-duration="3">3s</button>
-                <button class="chip" data-duration="5">5s</button>
+                <button class="chip" data-duration="3">3s</button>
+                <button class="chip active" data-duration="5">5s</button>
+                <button class="chip" data-duration="8">8s</button>
               </div>
             </div>
 
@@ -145,7 +132,7 @@
       <section id="page-voice-notes" class="page">
         <div class="page-header">
           <h1>Voice Notes</h1>
-          <p class="page-subtitle">Add voice recordings to improve identification accuracy. Fine-tune your model after adding 5+ notes.</p>
+          <p class="page-subtitle">Add recordings in different moods, volumes and places. After 3+ notes, calibrate to learn your personal threshold.</p>
         </div>
 
         <div class="voice-notes-layout">
@@ -161,11 +148,16 @@
             </div>
 
             <div id="vn-record-section" class="vn-record-section hidden">
+            <div class="read-prompt">
+              <div class="read-prompt-label">📖 Read this aloud, without long pauses</div>
+              <div class="read-prompt-text">"Yesterday I bought fresh bread, green apples and a small bottle of milk from the shop at the corner of our street."</div>
+            </div>
+
               <div class="form-group">
                 <label class="form-label">Duration</label>
                 <div class="duration-chips">
-                  <button class="chip vn-dur-chip active" data-duration="3">3s</button>
-                  <button class="chip vn-dur-chip" data-duration="5">5s</button>
+                  <button class="chip vn-dur-chip" data-duration="3">3s</button>
+                  <button class="chip vn-dur-chip active" data-duration="5">5s</button>
                   <button class="chip vn-dur-chip" data-duration="8">8s</button>
                   <button class="chip vn-dur-chip" data-duration="10">10s</button>
                 </div>
@@ -201,7 +193,7 @@
           <div class="vn-right-col">
             <!-- Model Status Card -->
             <div class="card glass vn-model-card">
-              <h2 class="card-title">Model Status</h2>
+              <h2 class="card-title">Calibration</h2>
               <div id="vn-model-status" class="vn-model-status">
                 <div class="empty-state-sm">Select a speaker to view model status.</div>
               </div>
@@ -221,42 +213,75 @@
         </div>
       </section>
 
-      <!-- ═══ PAGE: MONITOR ══════════════════════════════════════════════ -->
+      <!-- ═══ PAGE: DOOR ═════════════════════════════════════════════════ -->
       <section id="page-monitor" class="page">
         <div class="page-header">
-          <h1>Live Monitor</h1>
-          <p class="page-subtitle">Real-time keyword detection with deep learning speaker verification.</p>
+          <h1>Door Lock</h1>
+          <p class="page-subtitle">Say the phrase on screen. The door opens only if your voice matches an enrolled person.</p>
         </div>
 
         <div class="monitor-controls-bar">
-          <div class="form-group inline">
-            <label for="monitor-speaker-select" class="form-label">Listening for</label>
-            <select id="monitor-speaker-select" class="form-select">
-              <option value="">— Select Speaker —</option>
-            </select>
-          </div>
-          <!-- Keyword badge shown when a keyword is configured -->
-          <div id="keyword-badge-wrap" class="keyword-badge-wrap hidden">
-            <span class="keyword-badge">🔑 <span id="active-keyword-text"></span></span>
-          </div>
-          <!-- Matching mode badge -->
-          <div id="matching-mode-wrap" class="matching-mode-wrap hidden">
-            <span id="matching-mode-badge" class="matching-mode-badge">similarity</span>
-          </div>
-          <button id="listen-btn" class="btn-listen" disabled>
+          <button id="listen-btn" class="btn-listen">
             <span id="listen-btn-icon">▶</span>
             <span id="listen-btn-text">Start Listening</span>
           </button>
+          <div id="matching-mode-wrap" class="matching-mode-wrap hidden">
+            <span id="matching-mode-badge" class="matching-mode-badge"></span>
+          </div>
         </div>
 
         <!-- Live Transcript Bar -->
         <div id="live-transcript-bar" class="live-transcript-bar hidden">
           <span class="transcript-icon">🎤</span>
           <span id="live-transcript-text" class="live-transcript-text">Listening for speech…</span>
-          <span id="keyword-match-badge" class="keyword-match-badge hidden">✅ Keyword detected</span>
+          <span id="keyword-match-badge" class="keyword-match-badge hidden">✅ Phrase heard</span>
         </div>
 
-        <div class="monitor-grid">
+        <div class="door-grid">
+          <!-- Lock -->
+          <div class="card glass door-card">
+            <div id="door-panel" class="door-panel locked">
+              <div id="lock-icon" class="lock-icon">🔒</div>
+              <div id="lock-state" class="lock-state">LOCKED</div>
+              <div id="lock-detail" class="lock-detail">Press “Start Listening”, then say the phrase.</div>
+            </div>
+            <div id="challenge-box" class="challenge-box hidden">
+              <div class="challenge-label">Say this phrase</div>
+              <div id="challenge-phrase" class="challenge-phrase">—</div>
+            </div>
+            <button id="lock-now-btn" class="btn-secondary hidden">🔒 Lock now</button>
+          </div>
+
+          <!-- Live identification -->
+          <div class="card glass score-card">
+            <h3 class="card-title-sm">Who is speaking?</h3>
+            <div id="live-speaker" class="live-speaker">—</div>
+            <div class="score-gauges">
+              <div class="gauge-wrap">
+                <label class="gauge-label">Similarity <span class="badge badge-dl">Latest 1.5 s</span></label>
+                <div class="gauge-bar-bg">
+                  <div class="gauge-bar gauge-bar-dl" id="dl-score-bar" style="width:0%"></div>
+                </div>
+                <span class="gauge-value" id="dl-score-val">—</span>
+              </div>
+              <div class="gauge-wrap">
+                <label class="gauge-label">Threshold <span class="badge badge-classifier">Required</span></label>
+                <div class="gauge-bar-bg">
+                  <div class="gauge-bar gauge-bar-classifier" id="classifier-score-bar" style="width:0%"></div>
+                </div>
+                <span class="gauge-value" id="classifier-score-val">—</span>
+              </div>
+              <div class="gauge-wrap fusion-wrap">
+                <label class="gauge-label">Recent Matches <span class="badge badge-fusion" id="match-mode-label">—</span></label>
+                <div class="gauge-bar-bg">
+                  <div class="gauge-bar gauge-bar-fusion" id="fusion-score-bar" style="width:0%"></div>
+                </div>
+                <span class="gauge-value" id="fusion-score-val">—</span>
+              </div>
+            </div>
+            <div id="all-scores" class="all-scores"></div>
+          </div>
+
           <!-- Level Meter -->
           <div class="card glass meter-card">
             <h3 class="card-title-sm">Audio Level</h3>
@@ -271,42 +296,24 @@
 
           <!-- FFT Spectrum -->
           <div class="card glass spectrum-card">
-            <h3 class="card-title-sm">FFT Spectrum</h3>
+            <h3 class="card-title-sm">Frequency Spectrum <span class="card-title-hint">— live (bars) vs. matched voiceprint (line)</span></h3>
             <canvas id="fft-canvas" class="spectrum-canvas"></canvas>
           </div>
 
-          <!-- Score Gauges — updated for v2 -->
-          <div class="card glass score-card">
-            <h3 class="card-title-sm">Match Scores</h3>
-            <div class="score-gauges">
-              <div class="gauge-wrap">
-                <label class="gauge-label">Similarity <span class="badge badge-dl">Embedding</span></label>
-                <div class="gauge-bar-bg">
-                  <div class="gauge-bar gauge-bar-dl" id="dl-score-bar" style="width:0%"></div>
-                </div>
-                <span class="gauge-value" id="dl-score-val">—</span>
-              </div>
-              <div class="gauge-wrap" id="classifier-gauge-wrap" style="display:none">
-                <label class="gauge-label">Classifier <span class="badge badge-classifier">Fine-tuned</span></label>
-                <div class="gauge-bar-bg">
-                  <div class="gauge-bar gauge-bar-classifier" id="classifier-score-bar" style="width:0%"></div>
-                </div>
-                <span class="gauge-value" id="classifier-score-val">—</span>
-              </div>
-              <div class="gauge-wrap fusion-wrap">
-                <label class="gauge-label">Match Score <span class="badge badge-fusion" id="match-mode-label">Final</span></label>
-                <div class="gauge-bar-bg">
-                  <div class="gauge-bar gauge-bar-fusion" id="fusion-score-bar" style="width:0%"></div>
-                </div>
-                <span class="gauge-value" id="fusion-score-val">—</span>
-              </div>
+          <!-- Access Log -->
+          <div class="card glass access-card">
+            <div class="card-header-row">
+              <h3 class="card-title-sm">Access Log</h3>
+            </div>
+            <div id="access-log" class="match-log">
+              <div class="empty-state-sm">No attempts yet.</div>
             </div>
           </div>
 
-          <!-- Match Log -->
+          <!-- Window Log -->
           <div class="card glass log-card">
             <div class="card-header-row">
-              <h3 class="card-title-sm">Match Log</h3>
+              <h3 class="card-title-sm">Live Analysis</h3>
               <button id="clear-log-btn" class="btn-icon-sm">Clear</button>
             </div>
             <div id="match-log" class="match-log">
@@ -320,10 +327,31 @@
       <section id="page-settings" class="page">
         <div class="page-header">
           <h1>Settings</h1>
-          <p class="page-subtitle">Configure thresholds for speaker verification.</p>
+          <p class="page-subtitle">Door behaviour and per-speaker thresholds.</p>
         </div>
 
         <div class="settings-grid">
+          <div class="card glass">
+            <h2 class="card-title">Door</h2>
+            <label class="toggle-row">
+              <input type="checkbox" id="require-challenge" />
+              <span>
+                <strong>Require random challenge phrase</strong><br />
+                <span class="slider-hint">Blocks replaying a recording of someone's voice. Needs Chrome or Edge (speech recognition) and internet.</span>
+              </span>
+            </label>
+            <div class="slider-group">
+              <div class="slider-row">
+                <label class="slider-label">Unlock duration</label>
+                <span id="unlock-seconds-val" class="slider-value">5 s</span>
+              </div>
+              <input type="range" id="unlock-seconds" class="slider" min="2" max="30" step="1" value="5" />
+              <p class="slider-hint">How long the door stays open before locking again automatically.</p>
+            </div>
+            <button id="save-door-btn" class="btn-primary">Save Door Settings</button>
+            <div id="door-saved-msg" class="settings-saved-msg hidden"></div>
+          </div>
+
           <div class="card glass">
             <h2 class="card-title">Speaker Thresholds</h2>
             <div class="form-group">
@@ -337,19 +365,10 @@
               <div class="slider-group">
                 <div class="slider-row">
                   <label class="slider-label">Similarity Threshold <span class="badge badge-dl">Embedding</span></label>
-                  <span id="similarity-threshold-val" class="slider-value">0.65</span>
+                  <span id="similarity-threshold-val" class="slider-value">0.50</span>
                 </div>
-                <input type="range" id="similarity-threshold" class="slider" min="0.3" max="0.95" step="0.01" value="0.65" />
-                <p class="slider-hint">Cosine similarity threshold for centroid matching. Higher = stricter.</p>
-              </div>
-
-              <div class="slider-group">
-                <div class="slider-row">
-                  <label class="slider-label">Classifier Threshold <span class="badge badge-classifier">Fine-tuned</span></label>
-                  <span id="classifier-threshold-val" class="slider-value">0.70</span>
-                </div>
-                <input type="range" id="classifier-threshold" class="slider" min="0.3" max="0.95" step="0.01" value="0.70" />
-                <p class="slider-hint">Confidence threshold for the fine-tuned classifier. Only used when model is trained.</p>
+                <input type="range" id="similarity-threshold" class="slider" min="0.30" max="0.90" step="0.01" value="0.50" />
+                <p class="slider-hint">How similar a 1.5 s window must be to your voiceprint (cosine similarity). The same person usually scores 0.5–0.8, other people 0–0.3. Higher = stricter. Calibrating on the Voice Notes page sets this for you.</p>
               </div>
 
               <button id="save-settings-btn" class="btn-primary">Save Settings</button>
